@@ -2536,6 +2536,344 @@ describe("ProviderRuntimeIngestion", () => {
     expect(message?.streaming).toBe(false);
   });
 
+  it("flushes buffered assistant text progressively at the low-water mark and completes with the remainder", async () => {
+    const harness = await createHarness();
+    const startedAt = "2026-01-01T00:00:00.000Z";
+    const secondDeltaAt = "2026-01-01T00:00:00.100Z";
+    const completedAt = "2026-01-01T00:00:00.200Z";
+    const firstChunk = "a".repeat(2_500);
+    const secondChunk = "b".repeat(500);
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-progressive-flush"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: startedAt,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-progressive-flush"),
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "running" &&
+        thread.session?.activeTurnId === "turn-progressive-flush",
+    );
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-message-delta-progressive-flush-first"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: startedAt,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-progressive-flush"),
+      itemId: asItemId("item-progressive-flush"),
+      payload: {
+        streamKind: "assistant_text",
+        delta: firstChunk,
+      },
+    });
+
+    // Past the low-water mark with no prior flush: ships mid-turn instead of
+    // waiting for completion.
+    await waitForThread(harness.readModel, (entry) =>
+      entry.messages.some(
+        (message: ProviderRuntimeTestMessage) =>
+          message.id === "assistant:item-progressive-flush" &&
+          message.streaming &&
+          message.text === firstChunk,
+      ),
+    );
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-message-delta-progressive-flush-second"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: secondDeltaAt,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-progressive-flush"),
+      itemId: asItemId("item-progressive-flush"),
+      payload: {
+        streamKind: "assistant_text",
+        delta: secondChunk,
+      },
+    });
+
+    // Under the low-water mark: stays buffered, no mid-turn update.
+    await harness.drain();
+    const midReadModel = await harness.readModel();
+    const midThread = midReadModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    const midMessage = midThread?.messages.find(
+      (entry: ProviderRuntimeTestMessage) => entry.id === "assistant:item-progressive-flush",
+    );
+    expect(midMessage?.text).toBe(firstChunk);
+    expect(midMessage?.streaming).toBe(true);
+
+    harness.emit({
+      type: "item.completed",
+      eventId: asEventId("evt-message-completed-progressive-flush"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: completedAt,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-progressive-flush"),
+      itemId: asItemId("item-progressive-flush"),
+      payload: {
+        itemType: "assistant_message",
+        status: "completed",
+      },
+    });
+
+    const thread = await waitForThread(harness.readModel, (entry) =>
+      entry.messages.some(
+        (message: ProviderRuntimeTestMessage) =>
+          message.id === "assistant:item-progressive-flush" && !message.streaming,
+      ),
+    );
+    const message = thread.messages.find(
+      (entry: ProviderRuntimeTestMessage) => entry.id === "assistant:item-progressive-flush",
+    );
+    expect(message?.text).toBe(`${firstChunk}${secondChunk}`);
+    expect(message?.streaming).toBe(false);
+  });
+
+  it("gates progressive buffered flushes by time since the last flush", async () => {
+    const harness = await createHarness();
+    const startedAt = "2026-01-01T00:00:00.000Z";
+    const secondDeltaAt = "2026-01-01T00:00:00.100Z";
+    const thirdDeltaAt = "2026-01-01T00:00:02.000Z";
+    const completedAt = "2026-01-01T00:00:02.100Z";
+    const firstChunk = "a".repeat(2_500);
+    const secondChunk = "b".repeat(2_500);
+    const thirdChunk = "c";
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-progressive-time-gate"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: startedAt,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-progressive-time-gate"),
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "running" &&
+        thread.session?.activeTurnId === "turn-progressive-time-gate",
+    );
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-message-delta-progressive-time-gate-first"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: startedAt,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-progressive-time-gate"),
+      itemId: asItemId("item-progressive-time-gate"),
+      payload: {
+        streamKind: "assistant_text",
+        delta: firstChunk,
+      },
+    });
+    await waitForThread(harness.readModel, (entry) =>
+      entry.messages.some(
+        (message: ProviderRuntimeTestMessage) =>
+          message.id === "assistant:item-progressive-time-gate" && message.text === firstChunk,
+      ),
+    );
+
+    // Low-water mark reached again, but inside the 1s window since the last
+    // flush: stays buffered.
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-message-delta-progressive-time-gate-second"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: secondDeltaAt,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-progressive-time-gate"),
+      itemId: asItemId("item-progressive-time-gate"),
+      payload: {
+        streamKind: "assistant_text",
+        delta: secondChunk,
+      },
+    });
+    await harness.drain();
+    const midReadModel = await harness.readModel();
+    const midThread = midReadModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(
+      midThread?.messages.find(
+        (entry: ProviderRuntimeTestMessage) => entry.id === "assistant:item-progressive-time-gate",
+      )?.text,
+    ).toBe(firstChunk);
+
+    // Once the window passes, the next delta flushes the accumulated buffer.
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-message-delta-progressive-time-gate-third"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: thirdDeltaAt,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-progressive-time-gate"),
+      itemId: asItemId("item-progressive-time-gate"),
+      payload: {
+        streamKind: "assistant_text",
+        delta: thirdChunk,
+      },
+    });
+    await waitForThread(harness.readModel, (entry) =>
+      entry.messages.some(
+        (message: ProviderRuntimeTestMessage) =>
+          message.id === "assistant:item-progressive-time-gate" &&
+          message.streaming &&
+          message.text === `${firstChunk}${secondChunk}${thirdChunk}`,
+      ),
+    );
+
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-turn-completed-progressive-time-gate"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: completedAt,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-progressive-time-gate"),
+      payload: {
+        state: "completed",
+      },
+    });
+    const thread = await waitForThread(harness.readModel, (entry) =>
+      entry.messages.some(
+        (message: ProviderRuntimeTestMessage) =>
+          message.id === "assistant:item-progressive-time-gate" && !message.streaming,
+      ),
+    );
+    const message = thread.messages.find(
+      (entry: ProviderRuntimeTestMessage) => entry.id === "assistant:item-progressive-time-gate",
+    );
+    expect(message?.text).toBe(`${firstChunk}${secondChunk}${thirdChunk}`);
+    expect(message?.streaming).toBe(false);
+  });
+
+  it("surfaces reasoning deltas as a single throttled activity row", async () => {
+    const harness = await createHarness();
+    const startedAt = "2026-01-01T00:00:00.000Z";
+    const secondDeltaAt = "2026-01-01T00:00:00.100Z";
+    const thirdDeltaAt = "2026-01-01T00:00:00.200Z";
+    const completedAt = "2026-01-01T00:00:00.300Z";
+    const reasoningActivityId = "reasoning:thread-1:item-reasoning";
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-reasoning"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: startedAt,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-reasoning"),
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "running" && thread.session?.activeTurnId === "turn-reasoning",
+    );
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-reasoning-delta-first"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: startedAt,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-reasoning"),
+      itemId: asItemId("item-reasoning"),
+      payload: {
+        streamKind: "reasoning_text",
+        delta: "thinking step one",
+      },
+    });
+
+    // First delta emits immediately so the thinking phase is visible.
+    const threadWithActivity = await waitForThread(harness.readModel, (entry) =>
+      entry.activities.some(
+        (activity: ProviderRuntimeTestActivity) => activity.id === reasoningActivityId,
+      ),
+    );
+    const activity = threadWithActivity.activities.find(
+      (entry: ProviderRuntimeTestActivity) => entry.id === reasoningActivityId,
+    );
+    expect(activity?.kind).toBe("task.progress");
+    const payload = activity?.payload as Record<string, unknown>;
+    expect(payload.taskId).toBe(reasoningActivityId);
+    expect(payload.title).toBe("Reasoning");
+    expect(payload.agentKind).toBe("background");
+    expect(payload.detail).toContain("step one");
+
+    // Rapid follow-up deltas inside the throttle window accumulate without
+    // updating the row.
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-reasoning-delta-second"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: secondDeltaAt,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-reasoning"),
+      itemId: asItemId("item-reasoning"),
+      payload: {
+        streamKind: "reasoning_text",
+        delta: " and step two",
+      },
+    });
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-reasoning-delta-third"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: thirdDeltaAt,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-reasoning"),
+      itemId: asItemId("item-reasoning"),
+      payload: {
+        streamKind: "reasoning_text",
+        delta: " and step three",
+      },
+    });
+    await harness.drain();
+    const midReadModel = await harness.readModel();
+    const midThread = midReadModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    const midActivities = midThread?.activities.filter(
+      (entry: ProviderRuntimeTestActivity) => entry.id === reasoningActivityId,
+    );
+    expect(midActivities).toHaveLength(1);
+    const midPayload = midActivities?.[0]?.payload as Record<string, unknown> | undefined;
+    expect(midPayload?.detail).not.toContain("step two");
+    // Reasoning never becomes assistant message text.
+    expect(
+      midThread?.messages.some(
+        (message: ProviderRuntimeTestMessage) => message.id === "assistant:item-reasoning",
+      ),
+    ).toBe(false);
+
+    // Turn completion flushes the pending tail into the same stable row.
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-turn-completed-reasoning"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: completedAt,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-reasoning"),
+      payload: {
+        state: "completed",
+      },
+    });
+    const finalThread = await waitForThread(harness.readModel, (entry) =>
+      entry.activities.some(
+        (activity: ProviderRuntimeTestActivity) =>
+          activity.id === reasoningActivityId &&
+          String((activity.payload as Record<string, unknown>).detail).includes("step three"),
+      ),
+    );
+    const finalActivities = finalThread.activities.filter(
+      (entry: ProviderRuntimeTestActivity) => entry.id === reasoningActivityId,
+    );
+    expect(finalActivities).toHaveLength(1);
+    const finalPayload = finalActivities[0]?.payload as Record<string, unknown> | undefined;
+    expect(finalPayload?.detail).toContain("step one");
+  });
+
   it("does not duplicate assistant completion when item.completed is followed by turn.completed", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";

@@ -21,6 +21,7 @@ import {
 } from "@t3tools/contracts";
 import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -48,6 +49,7 @@ import { canReplaceThreadTitle } from "../threadTitles.ts";
 
 const providerTurnKey = (threadId: ThreadId, turnId: TurnId) => `${threadId}:${turnId}`;
 const providerTaskKey = (threadId: ThreadId, taskId: string) => `${threadId}:${taskId}`;
+const reasoningActivityKeyPrefix = (threadId: ThreadId) => `reasoning:${threadId}:`;
 
 // Fallback when the in-memory description cache no longer has the task name
 // (server restart, session-exit sweep, TTL/capacity eviction): earlier
@@ -90,6 +92,13 @@ interface AssistantSegmentState {
   activeMessageId: MessageId | null;
 }
 
+interface ReasoningActivityState {
+  text: string;
+  turnId: TurnId | null;
+  lastEmittedAtMillis: number;
+  pendingEmit: boolean;
+}
+
 const TURN_MESSAGE_IDS_BY_TURN_CACHE_CAPACITY = 10_000;
 const TURN_MESSAGE_IDS_BY_TURN_TTL = Duration.minutes(120);
 const BUFFERED_MESSAGE_TEXT_BY_MESSAGE_ID_CACHE_CAPACITY = 20_000;
@@ -98,7 +107,22 @@ const BUFFERED_PROPOSED_PLAN_BY_ID_CACHE_CAPACITY = 10_000;
 const BUFFERED_PROPOSED_PLAN_BY_ID_TTL = Duration.minutes(120);
 const TASK_DESCRIPTION_BY_TASK_CACHE_CAPACITY = 10_000;
 const TASK_DESCRIPTION_BY_TASK_TTL = Duration.minutes(120);
+const ASSISTANT_FLUSH_STATE_BY_MESSAGE_ID_CACHE_CAPACITY = 20_000;
+const ASSISTANT_FLUSH_STATE_BY_MESSAGE_ID_TTL = Duration.minutes(120);
+const REASONING_ACTIVITY_BY_KEY_CACHE_CAPACITY = 20_000;
+const REASONING_ACTIVITY_BY_KEY_TTL = Duration.minutes(120);
 const MAX_BUFFERED_ASSISTANT_CHARS = 24_000;
+// Buffered mode still streams progressively: once this much text has
+// accumulated AND this much time has passed since the last flush, the buffer
+// ships as one assistant delta instead of waiting for turn end.
+const PROGRESSIVE_FLUSH_MIN_ASSISTANT_CHARS = 2_000;
+const PROGRESSIVE_FLUSH_INTERVAL_MS = 1_000;
+// Reasoning deltas arrive per token; the work-log row they feed is
+// latest-state, so emissions are throttled per message and the accumulated
+// text is capped (only the tail is ever shown).
+const REASONING_ACTIVITY_THROTTLE_MS = 1_000;
+const REASONING_ACTIVITY_DETAIL_CHARS = 240;
+const REASONING_ACTIVITY_BUFFER_CHARS = 4_000;
 const STRICT_PROVIDER_LIFECYCLE_GUARD = process.env.T3CODE_STRICT_PROVIDER_LIFECYCLE_GUARD !== "0";
 
 type TurnStartRequestedDomainEvent = Extract<
@@ -210,6 +234,15 @@ function maxCheckpointTurnCount(
 function truncateDetail(value: string, limit = 180): string {
   return value.length > limit ? `${value.slice(0, limit - 3)}...` : value;
 }
+
+// Throttle windows are measured on provider-stamped event time so a burst of
+// deltas sharing one timestamp collapses into a single emission; an
+// unparseable timestamp falls back to the wall clock.
+const eventTimeMillis = (createdAt: string) =>
+  Effect.map(Clock.currentTimeMillis, (nowMillis) => {
+    const parsed = Date.parse(createdAt);
+    return Number.isNaN(parsed) ? nowMillis : parsed;
+  });
 
 function normalizeProposedPlanMarkdown(planMarkdown: string | undefined): string | undefined {
   const trimmed = planMarkdown?.trim();
@@ -936,6 +969,28 @@ const make = Effect.gen(function* () {
     lookup: () => Effect.succeed(""),
   });
 
+  // Last buffered-mode flush per assistant message (event-time millis); drives
+  // the progressive low-water flush. 0 means "never flushed".
+  const assistantFlushStateByMessageId = yield* Cache.make<MessageId, number>({
+    capacity: ASSISTANT_FLUSH_STATE_BY_MESSAGE_ID_CACHE_CAPACITY,
+    timeToLive: ASSISTANT_FLUSH_STATE_BY_MESSAGE_ID_TTL,
+    lookup: () => Effect.succeed(0),
+  });
+
+  // Accumulated reasoning text per message, feeding one throttled
+  // latest-state work-log row per reasoning stream.
+  const reasoningActivityByKey = yield* Cache.make<string, ReasoningActivityState>({
+    capacity: REASONING_ACTIVITY_BY_KEY_CACHE_CAPACITY,
+    timeToLive: REASONING_ACTIVITY_BY_KEY_TTL,
+    lookup: () =>
+      Effect.succeed({
+        text: "",
+        turnId: null,
+        lastEmittedAtMillis: 0,
+        pendingEmit: false,
+      }),
+  });
+
   const rememberTaskDescription = (threadId: ThreadId, taskId: string, description: string) =>
     Cache.set(taskDescriptionByTaskKey, providerTaskKey(threadId, taskId), description);
 
@@ -1082,25 +1137,31 @@ const make = Effect.gen(function* () {
       });
     });
 
-  const appendBufferedAssistantText = (messageId: MessageId, delta: string) =>
-    Cache.getOption(bufferedAssistantTextByMessageId, messageId).pipe(
-      Effect.flatMap((existingText) =>
-        Effect.gen(function* () {
-          const nextText = Option.match(existingText, {
-            onNone: () => delta,
-            onSome: (text) => `${text}${delta}`,
-          });
-          if (nextText.length <= MAX_BUFFERED_ASSISTANT_CHARS) {
-            yield* Cache.set(bufferedAssistantTextByMessageId, messageId, nextText);
-            return "";
-          }
+  const appendBufferedAssistantText = (messageId: MessageId, delta: string, nowMillis: number) =>
+    Effect.gen(function* () {
+      const existingText = yield* Cache.getOption(bufferedAssistantTextByMessageId, messageId);
+      const nextText = Option.match(existingText, {
+        onNone: () => delta,
+        onSome: (text) => `${text}${delta}`,
+      });
+      const lastFlushAtMillis = yield* Cache.get(assistantFlushStateByMessageId, messageId);
+      const shouldFlush =
+        nextText.length > MAX_BUFFERED_ASSISTANT_CHARS ||
+        (nextText.length >= PROGRESSIVE_FLUSH_MIN_ASSISTANT_CHARS &&
+          nowMillis - lastFlushAtMillis >= PROGRESSIVE_FLUSH_INTERVAL_MS);
+      if (!shouldFlush) {
+        yield* Cache.set(bufferedAssistantTextByMessageId, messageId, nextText);
+        return "";
+      }
 
-          // Safety valve: flush full buffered text as an assistant delta to cap memory.
-          yield* Cache.invalidate(bufferedAssistantTextByMessageId, messageId);
-          return nextText;
-        }),
-      ),
-    );
+      // Flush the full buffered text as an assistant delta: past
+      // MAX_BUFFERED_ASSISTANT_CHARS this caps memory; past the low-water mark
+      // it keeps the UI updating during the turn without token-by-token
+      // websocket traffic.
+      yield* Cache.invalidate(bufferedAssistantTextByMessageId, messageId);
+      yield* Cache.set(assistantFlushStateByMessageId, messageId, nowMillis);
+      return nextText;
+    });
 
   const takeBufferedAssistantText = (messageId: MessageId) =>
     Cache.getOption(bufferedAssistantTextByMessageId, messageId).pipe(
@@ -1139,7 +1200,121 @@ const make = Effect.gen(function* () {
     Cache.invalidate(bufferedProposedPlanById, planId);
 
   const clearAssistantMessageState = (messageId: MessageId) =>
-    clearBufferedAssistantText(messageId);
+    Effect.gen(function* () {
+      yield* clearBufferedAssistantText(messageId);
+      yield* Cache.invalidate(assistantFlushStateByMessageId, messageId);
+    });
+
+  const reasoningActivityKeyForEvent = (threadId: ThreadId, event: ProviderRuntimeEvent) =>
+    `${reasoningActivityKeyPrefix(threadId)}${assistantSegmentBaseKeyFromEvent(event)}`;
+
+  const emitReasoningActivity = (input: {
+    event: ProviderRuntimeEvent;
+    threadId: ThreadId;
+    reasoningKey: string;
+    text: string;
+    turnId: TurnId | null;
+    createdAt: string;
+  }) =>
+    providerCommandId(input.event, "reasoning-activity").pipe(
+      Effect.flatMap((commandId) =>
+        orchestrationEngine.dispatch({
+          type: "thread.activity.append",
+          commandId,
+          threadId: input.threadId,
+          activity: {
+            // Stable per-message id: reasoning activity is "latest state", so
+            // each throttled emission replaces the previous row.
+            id: EventId.make(input.reasoningKey),
+            createdAt: input.createdAt,
+            tone: "info",
+            kind: "task.progress",
+            summary: "Reasoning…",
+            payload: {
+              taskId: input.reasoningKey,
+              title: "Reasoning",
+              detail: truncateDetail(
+                input.text.slice(-REASONING_ACTIVITY_DETAIL_CHARS),
+                REASONING_ACTIVITY_DETAIL_CHARS,
+              ),
+              // Turn narration, not a subagent: the background stamp keeps the
+              // row in the ordinary work log instead of the Agents surface.
+              agentKind: "background",
+            },
+            turnId: input.turnId,
+          },
+          createdAt: input.createdAt,
+        }),
+      ),
+    );
+
+  const recordReasoningDelta = (input: {
+    event: ProviderRuntimeEvent;
+    threadId: ThreadId;
+    delta: string;
+  }) =>
+    Effect.gen(function* () {
+      const reasoningKey = reasoningActivityKeyForEvent(input.threadId, input.event);
+      const nowMillis = yield* eventTimeMillis(input.event.createdAt);
+      const existing = yield* Cache.get(reasoningActivityByKey, reasoningKey);
+      const nextText = `${existing.text}${input.delta}`.slice(-REASONING_ACTIVITY_BUFFER_CHARS);
+      const shouldEmit = nowMillis - existing.lastEmittedAtMillis >= REASONING_ACTIVITY_THROTTLE_MS;
+      const turnId = toTurnId(input.event.turnId) ?? existing.turnId;
+      yield* Cache.set(reasoningActivityByKey, reasoningKey, {
+        text: nextText,
+        turnId,
+        lastEmittedAtMillis: shouldEmit ? nowMillis : existing.lastEmittedAtMillis,
+        pendingEmit: !shouldEmit,
+      });
+      if (shouldEmit) {
+        yield* emitReasoningActivity({
+          event: input.event,
+          threadId: input.threadId,
+          reasoningKey,
+          text: nextText,
+          turnId,
+          createdAt: input.event.createdAt,
+        });
+      }
+    });
+
+  // Turn end is the last chance to show reasoning accumulated inside the
+  // throttle window; entries are dropped afterwards to bound the cache.
+  const flushPendingReasoningActivities = (input: {
+    event: ProviderRuntimeEvent;
+    threadId: ThreadId;
+    createdAt: string;
+  }) =>
+    Effect.gen(function* () {
+      const prefix = reasoningActivityKeyPrefix(input.threadId);
+      const keys = Array.from(yield* Cache.keys(reasoningActivityByKey));
+      yield* Effect.forEach(
+        keys,
+        (key) =>
+          Effect.gen(function* () {
+            if (!key.startsWith(prefix)) {
+              return;
+            }
+            const state = yield* Cache.getOption(reasoningActivityByKey, key);
+            if (
+              Option.isSome(state) &&
+              state.value.pendingEmit &&
+              state.value.text.trim().length > 0
+            ) {
+              yield* emitReasoningActivity({
+                event: input.event,
+                threadId: input.threadId,
+                reasoningKey: key,
+                text: state.value.text,
+                turnId: state.value.turnId,
+                createdAt: input.createdAt,
+              });
+            }
+            yield* Cache.invalidate(reasoningActivityByKey, key);
+          }),
+        { concurrency: 1 },
+      ).pipe(Effect.asVoid);
+    });
 
   const flushBufferedAssistantMessage = (input: {
     event: ProviderRuntimeEvent;
@@ -1370,10 +1545,12 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const prefix = `${threadId}:`;
       const proposedPlanPrefix = `plan:${threadId}:`;
+      const reasoningPrefix = reasoningActivityKeyPrefix(threadId);
       const turnKeys = Array.from(yield* Cache.keys(turnMessageIdsByTurnKey));
       const assistantSegmentKeys = Array.from(yield* Cache.keys(assistantSegmentStateByTurnKey));
       const proposedPlanKeys = Array.from(yield* Cache.keys(bufferedProposedPlanById));
       const taskDescriptionKeys = Array.from(yield* Cache.keys(taskDescriptionByTaskKey));
+      const reasoningKeys = Array.from(yield* Cache.keys(reasoningActivityByKey));
       yield* Effect.forEach(
         turnKeys,
         (key) =>
@@ -1413,6 +1590,14 @@ const make = Effect.gen(function* () {
         taskDescriptionKeys,
         (key) =>
           key.startsWith(prefix) ? Cache.invalidate(taskDescriptionByTaskKey, key) : Effect.void,
+        { concurrency: 1 },
+      ).pipe(Effect.asVoid);
+      yield* Effect.forEach(
+        reasoningKeys,
+        (key) =>
+          key.startsWith(reasoningPrefix)
+            ? Cache.invalidate(reasoningActivityByKey, key)
+            : Effect.void,
         { concurrency: 1 },
       ).pipe(Effect.asVoid);
     });
@@ -1666,6 +1851,10 @@ const make = Effect.gen(function* () {
         event.type === "content.delta" && event.payload.streamKind === "assistant_text"
           ? event.payload.delta
           : undefined;
+      const reasoningDelta =
+        event.type === "content.delta" && event.payload.streamKind === "reasoning_text"
+          ? event.payload.delta
+          : undefined;
       const proposedPlanDelta =
         event.type === "turn.proposed.delta" ? event.payload.delta : undefined;
 
@@ -1685,7 +1874,11 @@ const make = Effect.gen(function* () {
           (settings) => (settings.enableLegacyTokenStreaming ? "streaming" : "buffered"),
         );
         if (assistantDeliveryMode === "buffered") {
-          const spillChunk = yield* appendBufferedAssistantText(assistantMessageId, assistantDelta);
+          const spillChunk = yield* appendBufferedAssistantText(
+            assistantMessageId,
+            assistantDelta,
+            yield* eventTimeMillis(event.createdAt),
+          );
           if (spillChunk.length > 0) {
             yield* orchestrationEngine.dispatch({
               type: "thread.message.assistant.delta",
@@ -1708,6 +1901,18 @@ const make = Effect.gen(function* () {
             createdAt: now,
           });
         }
+      }
+
+      // Reasoning deltas never become message text; they surface as one
+      // throttled latest-state activity row so the work log shows progress
+      // during the thinking phase. Stale events from a superseded turn are
+      // ignored, same as plan progress.
+      if (reasoningDelta && reasoningDelta.length > 0 && !conflictsWithActiveTurn) {
+        yield* recordReasoningDelta({
+          event,
+          threadId: thread.id,
+          delta: reasoningDelta,
+        });
       }
 
       const pauseForUserTurnId =
@@ -1867,6 +2072,12 @@ const make = Effect.gen(function* () {
           ).pipe(Effect.asVoid);
           yield* clearAssistantMessageIdsForTurn(thread.id, turnId);
           yield* clearAssistantSegmentStateForTurn(thread.id, turnId);
+
+          yield* flushPendingReasoningActivities({
+            event,
+            threadId: thread.id,
+            createdAt: now,
+          });
 
           yield* finalizeBufferedProposedPlan({
             event,
